@@ -1,7 +1,7 @@
 import albumentations as albu
 
 
-def get_training_augmentation():
+def get_training_augmentation(size: tuple[int, int] | None = None):
     """画像の水増し
     処理： 画像の反転、回転、平行移動、スケーリング、ノイズ付加、パースペクティブ変換、
            画質変化、明るさ・コントラスト変化、色調変化、シャープ化、ぼかし
@@ -11,6 +11,11 @@ def get_training_augmentation():
     _type_
         _description_
     """
+    if size is None:
+        height, width = 256, 256
+    else:
+        height, width = size
+
     train_transform = [
         albu.HorizontalFlip(p=0.5),  # 確率0.5で水平反転
         # 確率1で回転、平行移動、スケーリング
@@ -22,13 +27,13 @@ def get_training_augmentation():
         ),
         # 処理: 画像のパディングとクロップ
         albu.PadIfNeeded(
-            min_height=256,
-            min_width=256,
+            min_height=height,
+            min_width=width,
             always_apply=True,
             border_mode=0
         ),
-        # 高さ256、幅256でクロップ
-        albu.RandomCrop(height=256, width=256, always_apply=True),
+        # 高さ・幅を FIGURE.SIZE に揃えてクロップ
+        albu.RandomCrop(height=height, width=width, always_apply=True),
         # ノイズ付加
         albu.GaussNoise(p=0.2),
         # パースペクティブ変換：画像の視点を変える変換
@@ -59,8 +64,12 @@ def get_training_augmentation():
     return albu.Compose(train_transform)
 
 
-def get_validation_augmentation():
-    return albu.Compose([albu.PadIfNeeded(256, 256)])
+def get_validation_augmentation(size: tuple[int, int] | None = None):
+    if size is None:
+        height, width = 256, 256
+    else:
+        height, width = size
+    return albu.Compose([albu.PadIfNeeded(height, width)])
 
 
 def to_tensor(x, **kwargs):

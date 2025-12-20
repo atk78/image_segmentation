@@ -13,6 +13,7 @@ dependencies = [
     "pandas>=2.3.2",
     "scikit-learn>=1.7.2",
     "segmentation-models-pytorch>=0.5.0",
+    "transformers>=4.46.0",
     "torch>=2.8.0",
     "torchvision>=0.22.0",
     "tqdm>=4.67.1",
