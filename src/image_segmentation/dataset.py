@@ -5,26 +5,36 @@ from torch.utils.data import Dataset as BaseDataset
 
 
 class Dataset(BaseDataset):
-    CLASSES = ["outside", "lung", "heart", "body"]
-
     def __init__(
         self,
         images_dir: Path,
         masks_dir: Path,
-        classes: list[str] = None,
+        class_info: dict,
         augmentation=None,
         preprocessing=None
     ):
-        self.ids = [file.name for file in Path(images_dir).glob("*.bmp")]
-        self.images_fps = [
-            Path(images_dir).joinpath(image_id) for image_id in self.ids
-        ]
-        self.masks_fps = [
-            Path(masks_dir).joinpath(image_id) for image_id in self.ids
+        images_dir = Path(images_dir)
+        masks_dir = Path(masks_dir)
+
+        exts = (".bmp", ".png", ".jpg", ".jpeg", ".tif", ".tiff")
+        image_files = []
+        for ext in exts:
+            image_files.extend(images_dir.glob(f"*{ext}"))
+            image_files.extend(images_dir.glob(f"*{ext.upper()}"))
+
+        image_files = sorted(set(image_files))
+        paired = [
+            (img_path, masks_dir / img_path.name)
+            for img_path in image_files
+            if (masks_dir / img_path.name).exists()
         ]
 
+        self.images_fps = [p[0] for p in paired]
+        self.masks_fps = [p[1] for p in paired]
+        self.ids = [p.name for p in self.images_fps]
+        self.class_info = class_info
         self.class_values = [
-            self.CLASSES.index(cls.lower()) for cls in classes
+            v for k, v in class_info.items()
         ]
 
         self.augmentation = augmentation

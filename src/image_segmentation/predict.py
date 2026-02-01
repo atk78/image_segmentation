@@ -1,271 +1,301 @@
 """推論用スクリプト
 
-model/best_model.pth と model/params.yaml を読み込み、
-1 枚またはディレクトリ内の画像に対してセグメンテーション推論を行う。
+学習時の [configs/params.yaml] に合わせてモデルを復元し、
+1枚またはディレクトリ内の画像に対してセグメンテーション推論を行います。
 
-使用例 (モジュール実行):
+前提
+- `train.py` が保存した重みは `model.model.state_dict()`（= smp のモデル本体）
+- クラスは `CLASSES` の定義順をクラスindexとして扱う
 
-    python -m image_segmentation.predict ./data/test/img ./model
-
-使用例 (Python から呼び出し):
-
-    from image_segmentation.predict import predict
-    predict(
-        image_path_or_dir="./data/test/img/case225.bmp",
-        model_dir="./model",
-        device="cuda",
-    )
+CLI例
+    python -m image_segmentation.predict \
+        --input ./data/test/img \
+        --weights ./models/model1/best_model.pth \
+        --config ./configs/params.yaml \
+        --out ./outputs/pred
 """
 
+from __future__ import annotations
+
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Union
 
 import cv2
 import numpy as np
 import torch
-from transformers import AutoImageProcessor
-
-from .train import load_params
-from .model import SegmentationModel
-from .augm import get_preprocessing
-from .visualize import visualize
 import segmentation_models_pytorch as smp
+
+from .augm import get_preprocessing
+from .model import SegmentationModel
+from .train import load_params
+from .visualize import visualize
+
+
+SUPPORTED_IMAGE_EXTS = (".bmp", ".png", ".jpg", ".jpeg", ".tif", ".tiff")
+
+
+@dataclass(frozen=True)
+class PredictConfig:
+    class_info: dict
+    class_values: list[int]
+    fig_h: int
+    fig_w: int
+    arch: str
+    encoder: str
+    encoder_weights: str
+
+
+def _resolve_device(device: str | None) -> str:
+    if device is not None:
+        return device
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _iter_image_paths(path: Path) -> list[Path]:
+    if path.is_file():
+        return [path]
+
+    image_paths: list[Path] = []
+    for ext in SUPPORTED_IMAGE_EXTS:
+        image_paths.extend(path.glob(f"*{ext}"))
+        image_paths.extend(path.glob(f"*{ext.upper()}"))
+    return sorted(set(image_paths))
+
+
+def _load_predict_config(config_path: Path) -> PredictConfig:
+    params = load_params(config_path)
+
+    class_info = params.get(
+        "CLASSES",
+        {"background": 0, "object": 255},
+    )
+    class_values = [int(v) for _, v in class_info.items()]
+
+    figure_params = params.get("FIGURE", {})
+    figure_size = figure_params.get("SIZE", [512, 512])
+    fig_h, fig_w = int(figure_size[0]), int(figure_size[1])
+
+    model_params = params.get("MODEL", {})
+    model_type = model_params.get("TYPE", "model1")
+    hparams = model_params.get(model_type, {})
+    arch = hparams.get("ARCHITECTURE", "DeepLabV3Plus")
+    encoder = hparams.get("ENCODER", "resnet34")
+    encoder_weights = hparams.get("ENCODER_WEIGHTS", "imagenet")
+
+    return PredictConfig(
+        class_info=class_info,
+        class_values=class_values,
+        fig_h=fig_h,
+        fig_w=fig_w,
+        arch=arch,
+        encoder=encoder,
+        encoder_weights=encoder_weights,
+    )
 
 
 def _build_model(
-    model_dir: Path, device: str = "cpu"
-) -> tuple[SegmentationModel, dict]:
-    """model_dir 内の params.yaml と best_model.pth からモデルを構築する"""
-    config_path = model_dir.joinpath("params.yaml")
-    params = load_params(config_path)
-    model_params = params.get("MODEL", {})
-    figure_params = params.get("FIGURE", {})
-    figure_size = figure_params.get("SIZE", [256, 256])
-
-    model_type = model_params.get("TYPE", "DeepLabV3Plus")
-
-    if model_type == "DeepLabV3Plus":
-        dl_params = model_params.get("DeepLabV3Plus", {})
-        encoder = dl_params.get("ENCODER", "efficientnet-b0")
-        encoder_weights = dl_params.get("ENCODER_WEIGHTS", "imagenet")
-        classes = dl_params.get("CLASSES", ["lung"])
-
-        hparams = {
-            "ENCODER": encoder,
-            "ENCODER_WEIGHTS": encoder_weights,
-            "IN_CHANNELS": 3,
-            "OUT_CLASSES": len(classes),
-        }
-    elif model_type == "SegFormer":
-        sf_params = model_params.get("SegFormer", {})
-        model_name = sf_params.get(
-            "NAME", "nvidia/segformer-b0-finetuned-ade-512-512"
-        )
-        classes = sf_params.get("CLASSES", ["lung"])
-
-        hparams = {
-            "NAME": model_name,
-            "IN_CHANNELS": 3,
-            "OUT_CLASSES": len(classes),
-        }
-
-    elif model_type == "Mask2Former":
-        m2f_params = model_params.get("Mask2Former", {})
-        model_name = m2f_params.get(
-            "NAME", "facebook/mask2former-swin-small-ade-semantic"
-        )
-        classes = m2f_params.get("CLASSES", ["lung"])
-
-        hparams = {
-            "NAME": model_name,
-            "IN_CHANNELS": 3,
-            "OUT_CLASSES": len(classes),
-        }
-    else:
-        raise ValueError(f"Unsupported model TYPE in config: {model_type}")
-
-    # SegmentationModel を構築
+    cfg: PredictConfig,
+    device: str,
+    weights_path: Path,
+) -> SegmentationModel:
     model = SegmentationModel(
-        model_type=model_type,
-        hparams=hparams,
+        arch=cfg.arch,
+        encoder_name=cfg.encoder,
+        encoder_weights=cfg.encoder_weights,
+        in_channels=3,
+        out_classes=len(cfg.class_values),
+        learning_rate=1e-4,
     )
 
-    # 重みをロード
-    state_dict = torch.load(
-        model_dir.joinpath("best_model.pth"), map_location=device
-    )
-    # 学習時に保存したのは内部 model の state_dict なので、そのまま適用
-    model.model.load_state_dict(state_dict)
+    state = torch.load(weights_path, map_location=device)
+    try:
+        model.model.load_state_dict(state)
+    except RuntimeError:
+        model.load_state_dict(state)
+
     model.to(device)
     model.eval()
-
-    return model, {
-        "model_type": model_type,
-        "hparams": hparams,
-        "classes": classes,
-        "figure_size": figure_size,
-    }
+    return model
 
 
-def _build_preprocessing(meta: dict):
-    """推論時用の前処理関数を構築
-
-    学習時の train.py と同じポリシーで、DeepLabV3+ では smp の前処理、
-    SegFormer では 0-1 スケーリングのみを行い、get_preprocessing で
-    HWC->CHW/float32 変換を行う。
-    """
-    model_type = meta["model_type"]
-    hparams = meta["hparams"]
-
+def _build_preprocessing(cfg: PredictConfig):
     preprocessing_fn = None
-    if model_type == "DeepLabV3Plus":
-        encoder = hparams["ENCODER"]
-        encoder_weights = hparams["ENCODER_WEIGHTS"]
-        try:
-            preprocessing_fn = smp.encoders.get_preprocessing_fn(
-                encoder, encoder_weights
-            )
-        except Exception:
-            preprocessing_fn = None
-    elif model_type == "SegFormer":
-        def preprocessing_fn(x, **kwargs):
-            return x.astype("float32") / 255.0
-
-    elif model_type == "Mask2Former":
-        model_name = hparams["NAME"]
-        processor = AutoImageProcessor.from_pretrained(model_name)
-        mean = processor.image_mean
-        std = processor.image_std
-
-        def preprocessing_fn(x, **kwargs):
-            x = x.astype("float32") / 255.0
-            x = (x - mean) / std
-            return x
+    try:
+        preprocessing_fn = smp.encoders.get_preprocessing_fn(
+            cfg.encoder,
+            cfg.encoder_weights,
+        )
+    except Exception:
+        preprocessing_fn = None
 
     if preprocessing_fn is None:
         return None
     return get_preprocessing(preprocessing_fn)
 
 
-def _predict_single(
-    model: SegmentationModel,
+def _preprocess_image(
+    image_rgb: np.ndarray,
+    cfg: PredictConfig,
     preprocessing,
-    figure_size,
-    image_path: Path,
-    device: str = "cpu",
-    threshold: float = 0.5,
-):
-    """1枚の画像に対して推論し、元画像とマスクを返す"""
-    image = cv2.imread(str(image_path))
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-    # FIGURE.SIZE にリサイズ（[H, W]）
-    if figure_size is not None:
-        fig_h, fig_w = int(figure_size[0]), int(figure_size[1])
+) -> tuple[np.ndarray, torch.Tensor]:
+    resized = cv2.resize(image_rgb, (cfg.fig_w, cfg.fig_h))
+    if preprocessing is None:
+        x = resized.astype("float32") / 255.0
+        x = np.transpose(x, (2, 0, 1))
     else:
-        fig_h, fig_w = 256, 256
+        dummy_mask = np.zeros((cfg.fig_h, cfg.fig_w, 1), dtype="float32")
+        sample = preprocessing(image=resized, mask=dummy_mask)
+        x = sample["image"]
+    x_tensor = torch.from_numpy(x).unsqueeze(0)
+    return resized, x_tensor
 
-    image_resized = cv2.resize(image, (fig_w, fig_h))
 
-    if preprocessing is not None:
-        sample = preprocessing(
-            image=image_resized,
-            mask=np.zeros((fig_h, fig_w, 1), dtype="float32"),
-        )
-        input_image = sample["image"]  # CHW, float32
-    else:
-        # HWC -> CHW, 0-1 正規化
-        input_image = image_resized.astype("float32") / 255.0
-        input_image = np.transpose(input_image, (2, 0, 1))
+def _postprocess_mask(
+    prob: torch.Tensor,
+    cfg: PredictConfig,
+    threshold: float,
+) -> np.ndarray:
+    if len(cfg.class_values) == 1:
+        mask01 = (prob.squeeze(0).squeeze(0) > threshold).to(torch.uint8)
+        mask = (mask01.cpu().numpy() * cfg.class_values[0]).astype("uint8")
+        return mask
 
-    x_tensor = torch.from_numpy(input_image).unsqueeze(0).to(device)
+    pred_idx = prob.argmax(dim=1).squeeze(0).to(torch.long)
+    idx_np = pred_idx.cpu().numpy()
 
-    with torch.no_grad():
-        pr = model(x_tensor)
-        if model.out_classes == 1:
-            pr_mask = (
-                (pr.squeeze().cpu().numpy() > threshold).astype("float32")
-            )
-        else:
-            # 多クラスの場合は argmax で 1 チャネルに縮約
-            pr_mask = (
-                pr.squeeze(0)
-                .cpu()
-                .numpy()
-                .argmax(axis=0)
-                .astype("float32")
-            )
-
-    return image_resized, pr_mask
+    values = np.asarray(cfg.class_values, dtype="uint8")
+    mask = values[idx_np]
+    return mask
 
 
 def predict(
-    image_path_or_dir: Union[str, Path],
-    model_dir: Union[str, Path] = "./model",
+    input_path: str | Path | None = None,
+    weights_path: str | Path | None = None,
+    config_path: str | Path | None = None,
+    out_dir: str | Path | None = None,
     device: str | None = None,
-    visualize_result: bool = True,
     threshold: float = 0.5,
+    visualize_result: bool = False,
+    # --- backward compatible aliases (used by older notebooks) ---
+    image_path_or_dir: str | Path | None = None,
+    model_dir: str | Path | None = None,
 ):
-    """保存済みモデルで推論を行うヘルパー関数
+    """推論を実行してマスクを返す。
 
-    Parameters
-    ----------
-    image_path_or_dir : str or Path
-        単一画像パス、または画像ディレクトリ
-    model_dir : str or Path, optional
-        params.yaml と best_model.pth が置かれているディレクトリ
-    device : {"cpu", "cuda"}, optional
-        推論デバイス（None の場合は自動判定）
-    visualize_result : bool, optional
-        True の場合、最初の画像について visualize() で表示
+    - `out_dir` を指定すると `<stem>_pred.png` を保存
+    - 返り値は (image_path, resized_rgb, pred_mask_uint8) のリスト
     """
-    model_dir = Path(model_dir)
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Backward compatible mapping
+    if input_path is None and image_path_or_dir is not None:
+        input_path = image_path_or_dir
 
-    model, meta = _build_model(model_dir, device=device)
-    preprocessing = _build_preprocessing(meta)
+    if weights_path is None or config_path is None:
+        if model_dir is None:
+            raise TypeError(
+                "predict() requires either (weights_path, config_path) "
+                "or legacy model_dir."
+            )
+        model_dir = Path(model_dir)
+        if weights_path is None:
+            weights_path = model_dir / "best_model.pth"
+        if config_path is None:
+            cfg_in_model = model_dir / "params.yaml"
+            if cfg_in_model.exists():
+                config_path = cfg_in_model
+            else:
+                # Fallback: project-level config
+                config_path = (
+                    Path(__file__).parents[2] / "configs" / "params.yaml"
+                )
 
-    image_path_or_dir = Path(image_path_or_dir)
-    if image_path_or_dir.is_dir():
-        image_paths = sorted(image_path_or_dir.glob("*.bmp"))
-    else:
-        image_paths = [image_path_or_dir]
+    if input_path is None:
+        raise TypeError("predict() missing required input_path")
+
+    input_path = Path(input_path)
+    weights_path = Path(weights_path)
+    config_path = Path(config_path)
+    out_dir = Path(out_dir) if out_dir is not None else None
+
+    device = _resolve_device(device)
+    cfg = _load_predict_config(config_path)
+    model = _build_model(cfg, device=device, weights_path=weights_path)
+    preprocessing = _build_preprocessing(cfg)
+
+    image_paths = _iter_image_paths(input_path)
+    if not image_paths:
+        raise ValueError(f"No images found under: {input_path}")
+
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
 
     results = []
-    for img_path in image_paths:
-        img, mask = _predict_single(
-            model,
-            preprocessing,
-            figure_size=meta.get("figure_size", [256, 256]),
-            image_path=img_path,
-            device=device,
-            threshold=threshold,
-        )
-        results.append((img_path, img, mask))
+    for image_path in image_paths:
+        bgr = cv2.imread(str(image_path))
+        if bgr is None:
+            continue
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+        resized_rgb, x_tensor = _preprocess_image(rgb, cfg, preprocessing)
+        x_tensor = x_tensor.to(device)
+
+        with torch.no_grad():
+            prob = model(x_tensor)
+
+        pred_mask = _postprocess_mask(prob, cfg, threshold=threshold)
+
+        if out_dir is not None:
+            out_path = out_dir / f"{image_path.stem}_pred.png"
+            cv2.imwrite(str(out_path), pred_mask)
+
+        results.append((image_path, resized_rgb, pred_mask))
 
     if visualize_result and results:
-        _, img0, mask0 = results[0]
-        visualize(image=img0, mask=mask0)
+        _, rgb0, mask0 = results[0]
+        visualize(image=rgb0, mask=mask0)
 
     return results
 
 
-def main():
-    import sys
+def main(argv: list[str] | None = None) -> None:
+    import argparse
 
-    args = sys.argv
-    if not (2 <= len(args) <= 3):
-        print(
-            "Usage: python -m image_segmentation.predict "
-            "<image_path_or_dir> [model_dir]"
-        )
-        raise SystemExit(1)
+    parser = argparse.ArgumentParser(
+        description="Image segmentation prediction"
+    )
+    parser.add_argument(
+        "--input",
+        required=True,
+        help="Image file or directory",
+    )
+    parser.add_argument(
+        "--weights",
+        required=True,
+        help="Path to best_model.pth (saved model.model.state_dict())",
+    )
+    parser.add_argument("--config", required=True, help="Path to params.yaml")
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="Output directory (optional)",
+    )
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="cpu or cuda (optional)",
+    )
+    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--visualize", action="store_true")
+    args = parser.parse_args(argv)
 
-    image_path_or_dir = args[1]
-    model_dir = args[2] if len(args) == 3 else "./model"
-
-    predict(image_path_or_dir=image_path_or_dir, model_dir=model_dir)
+    predict(
+        input_path=args.input,
+        weights_path=args.weights,
+        config_path=args.config,
+        out_dir=args.out,
+        device=args.device,
+        threshold=args.threshold,
+        visualize_result=args.visualize,
+    )
 
 
 if __name__ == "__main__":
